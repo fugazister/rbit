@@ -1,12 +1,12 @@
 use std::fs::File;
-use std::io::Read;
 use std::path::PathBuf;
 
 use clap::Parser;
-use directories::ProjectDirs;
+use directories::BaseDirs;
 use reqwest::blocking::Client;
 use reqwest::blocking::multipart;
 use serde::Deserialize;
+use config::{Config as ConfigLoader, File as ConfigFile, FileFormat};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "simple qBittorrent client", long_about = None)]
@@ -57,40 +57,35 @@ struct QBConfig {
 }
 
 fn read_config(path: Option<PathBuf>) -> Config {
-    let config_path = match path {
-        Some(p) => p,
-        None => {
-            if let Some(dirs) = ProjectDirs::from("com", "example", "rbit") {
-                dirs.config_dir().join("rbit.toml")
-            } else {
-                PathBuf::from("rbit.toml")
-            }
-        }
-    };
+    // Build a config loader that reads from (in order):
+    // 1) explicit `--config` path (if provided)
+    // 2) XDG config path (if present)
+    // 3) local `./rbit.toml` (if present)
+    // All file sources are added as optional (not required) so missing files don't error.
+    let mut builder = ConfigLoader::builder();
 
-    // Prefer XDG config path but fall back to ./rbit.toml in the repo if present
-    let final_path = if config_path.exists() {
-        config_path
+    if let Some(p) = path {
+        builder = builder.add_source(ConfigFile::from(p).format(FileFormat::Toml).required(false));
     } else {
-        let local = PathBuf::from("rbit.toml");
-        if local.exists() {
-            local
-        } else {
-            config_path
+        // Prefer ~/.config/rbit/config.toml per user preference
+        if let Some(basedirs) = BaseDirs::new() {
+            let xdg = basedirs.config_dir().join("rbit").join("config.toml");
+            builder = builder.add_source(ConfigFile::from(xdg).format(FileFormat::Toml).required(false));
         }
-    };
+        // Also allow local ./rbit.toml for repo-level config
+    builder = builder.add_source(ConfigFile::from(PathBuf::from("rbit.toml")).format(FileFormat::Toml).required(false));
+    }
 
-    if final_path.exists() {
-        let mut s = String::new();
-        File::open(&final_path)
-            .and_then(|mut f| f.read_to_string(&mut s))
-            .expect("failed to read config");
-        toml::from_str(&s).expect("failed to parse config")
-    } else {
-        Config {
+    // Build the config loader; if building or deserialization fails, return defaults
+    match builder.build() {
+        Ok(loader) => loader.try_deserialize::<Config>().unwrap_or(Config {
             default_save_path: None,
             qbittorrent: None,
-        }
+        }),
+        Err(_) => Config {
+            default_save_path: None,
+            qbittorrent: None,
+        },
     }
 }
 
@@ -98,6 +93,7 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let config = read_config(args.config.clone());
 
+    // save path: CLI override > config.default_save_path > cwd
     let save_path = if let Some(d) = args.dest.clone() {
         d
     } else if let Some(ref s) = config.default_save_path {
