@@ -6,6 +6,7 @@ use directories::BaseDirs;
 use reqwest::blocking::Client;
 use reqwest::blocking::multipart;
 use serde::Deserialize;
+use tabled::{Table, Tabled};
 use config::{Config as ConfigLoader, File as ConfigFile, FileFormat};
 
 #[derive(Parser, Debug)]
@@ -158,6 +159,16 @@ struct TorrentInfo {
     upspeed: Option<u64>,
 }
 
+#[derive(Tabled)]
+struct TorrentRow {
+    id: String,
+    name: String,
+    status: String,
+    progress: String,
+    dl: String,
+    up: String,
+}
+
 fn bytes_human(b: u64) -> String {
     let kb = 1024u64;
     if b >= kb * kb * kb {
@@ -199,17 +210,19 @@ fn list_torrents(client: &Client, host: &str, username: Option<&str>, password: 
         progress < 1.0 || dls > 0 || ups > 0
     }).collect();
 
-    // header
-    println!("{:<10} {:<40} {:<12} {:>8} {:>12}", "id", "name", "status", "progress", "dl/up");
+    let mut table_rows: Vec<TorrentRow> = Vec::new();
     for t in rows {
-        let id = &t.hash[..8];
+        let id = if t.hash.len() >= 8 { t.hash[..8].to_string() } else { t.hash.clone() };
         let name = truncate(&t.name, 40);
-        let status = &t.state;
+        let status = t.state.clone();
         let progress = t.progress.map(|p| format!("{:.1}%", p * 100.0)).unwrap_or_else(|| "-".to_string());
         let dl = bytes_human(t.dlspeed.unwrap_or(0));
         let up = bytes_human(t.upspeed.unwrap_or(0));
-        println!("{:<10} {:<40} {:<12} {:>8} {:>6} / {:<6}", id, name, status, progress, dl, up);
+        table_rows.push(TorrentRow { id, name, status, progress, dl, up });
     }
+
+    let table = Table::new(table_rows).with(tabled::Style::psql());
+    println!("{}", table);
     Ok(())
 }
 
