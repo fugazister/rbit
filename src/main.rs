@@ -33,6 +33,14 @@ struct Args {
     /// qBittorrent password (overrides config)
     #[arg(long)]
     password: Option<String>,
+    
+    /// Do not send requests; print what would be sent
+    #[arg(long)]
+    dry_run: bool,
+    
+    /// Print verbose HTTP requests/responses
+    #[arg(long, short = 'v')]
+    verbose: bool,
 }
 
 #[derive(Deserialize, Debug)]
@@ -114,23 +122,26 @@ fn main() -> anyhow::Result<()> {
 
     // Determine input type and call API with derived host/credentials
     if args.input.starts_with("magnet:") {
-        add_magnet(&client, &host, username.as_deref(), password.as_deref(), &args.input, &save_path)?;
+        add_magnet(&client, &host, username.as_deref(), password.as_deref(), &args.input, &save_path, args.dry_run, args.verbose)?;
     } else {
-        add_torrent_file(&client, &host, username.as_deref(), password.as_deref(), PathBuf::from(args.input), &save_path)?;
+        add_torrent_file(&client, &host, username.as_deref(), password.as_deref(), PathBuf::from(args.input), &save_path, args.dry_run, args.verbose)?;
     }
 
     println!("Added to qBittorrent (destination: {})", save_path.display());
     Ok(())
 }
 
-// qb_host removed — host is computed from config/CLI overrides in `main`
-
-fn login(client: &Client, host: &str, username: Option<&str>, password: Option<&str>) -> anyhow::Result<()> {
+fn login(client: &Client, host: &str, username: Option<&str>, password: Option<&str>, verbose: bool) -> anyhow::Result<()> {
     if let (Some(user), Some(pass)) = (username, password) {
         let params = [("username", user), ("password", pass)];
         let url = format!("{}/api/v2/auth/login", host);
         let res = client.post(&url).form(&params).send()?;
+        let status = res.status();
         let text = res.text()?;
+        if verbose {
+            println!("[verbose] POST {} -> {}", url, status);
+            println!("[verbose] response: {}", text);
+        }
         if text != "Ok." {
             anyhow::bail!("login failed: {}", text);
         }
@@ -138,21 +149,31 @@ fn login(client: &Client, host: &str, username: Option<&str>, password: Option<&
     Ok(())
 }
 
-fn add_magnet(client: &Client, host: &str, username: Option<&str>, password: Option<&str>, magnet: &str, save_path: &PathBuf) -> anyhow::Result<()> {
-    login(client, host, username, password)?;
+fn add_magnet(client: &Client, host: &str, username: Option<&str>, password: Option<&str>, magnet: &str, save_path: &PathBuf, dry_run: bool, verbose: bool) -> anyhow::Result<()> {
     let url = format!("{}/api/v2/torrents/add", host);
     let save_path_s = save_path.to_string_lossy().to_string();
     let params = [("urls", magnet), ("savepath", save_path_s.as_str())];
+    if dry_run {
+        println!("[dry-run] POST {}", url);
+        println!("[dry-run] form params: urls={}, savepath={}", magnet, save_path.display());
+        return Ok(());
+    }
+    login(client, host, username, password, verbose)?;
     let res = client.post(&url).form(&params).send()?;
-    if res.status().is_success() {
+    let status = res.status();
+    let body = res.text()?;
+    if verbose {
+        println!("[verbose] POST {} -> {}", url, status);
+        println!("[verbose] response: {}", body);
+    }
+    if status.is_success() {
         Ok(())
     } else {
-        anyhow::bail!("failed to add magnet: {}", res.text()?);
+        anyhow::bail!("failed to add magnet: {}", body);
     }
 }
 
-fn add_torrent_file(client: &Client, host: &str, username: Option<&str>, password: Option<&str>, file: PathBuf, save_path: &PathBuf) -> anyhow::Result<()> {
-    login(client, host, username, password)?;
+fn add_torrent_file(client: &Client, host: &str, _username: Option<&str>, _password: Option<&str>, file: PathBuf, save_path: &PathBuf, dry_run: bool, verbose: bool) -> anyhow::Result<()> {
     let url = format!("{}/api/v2/torrents/add", host);
 
     let filename = file
@@ -163,14 +184,30 @@ fn add_torrent_file(client: &Client, host: &str, username: Option<&str>, passwor
 
     let file_part = multipart::Part::reader(File::open(&file)?).file_name(filename);
 
+    if dry_run {
+        println!("[dry-run] POST {}", url);
+        println!("[dry-run] file: {}", file.display());
+        println!("[dry-run] savepath: {}", save_path.display());
+        return Ok(());
+    }
+
+    // perform login first (no-op if no creds)
+    login(client, host, _username, _password, verbose)?;
+
     let form = multipart::Form::new()
         .part("torrents", file_part)
         .text("savepath", save_path.to_string_lossy().to_string());
 
     let res = client.post(&url).multipart(form).send()?;
-    if res.status().is_success() {
+    let status = res.status();
+    let body = res.text()?;
+    if verbose {
+        println!("[verbose] POST {} -> {}", url, status);
+        println!("[verbose] response: {}", body);
+    }
+    if status.is_success() {
         Ok(())
     } else {
-        anyhow::bail!("failed to add torrent file: {}", res.text()?);
+        anyhow::bail!("failed to add torrent file: {}", body);
     }
 }

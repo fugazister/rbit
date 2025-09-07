@@ -60,3 +60,17 @@ Notes & troubleshooting
 - You can override credentials on the command line with `--username` and `--password`.
 - For headless systems, `cargo build --release` produces the optimized binary in `./target/release`.
 
+Flags for debugging
+- `--dry-run` — do not send requests; print the HTTP method, URL, and form data that would be sent. Useful to validate the request without touching the qBittorrent instance.
+- `--verbose`, `-v` — print HTTP status codes and response bodies for actions (login, add torrent). Use together with `--dry-run` to see what would be sent and the verbose output.
+
+Examples:
+
+```sh
+# dry-run a magnet add
+./target/release/rbit 'magnet:?xt=urn:btih:...' --dest=/downloads --dry-run
+
+# real run with verbose output
+./target/release/rbit 'magnet:?xt=urn:btih:...' --dest=/downloads --verbose
+```
+
