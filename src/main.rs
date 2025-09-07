@@ -10,18 +10,11 @@ use config::{Config as ConfigLoader, File as ConfigFile, FileFormat};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "simple qBittorrent client", long_about = None)]
-struct Args {
-    /// Path to a .torrent file or a magnet link
-    input: String,
-
-    /// Destination folder for the torrent content
-    #[arg(short, long)]
-    dest: Option<PathBuf>,
-
+struct Cli {
     /// Path to config file (optional)
     #[arg(short = 'c', long)]
     config: Option<PathBuf>,
-    
+
     /// qBittorrent host (overrides config)
     #[arg(long)]
     host: Option<String>,
@@ -33,14 +26,36 @@ struct Args {
     /// qBittorrent password (overrides config)
     #[arg(long)]
     password: Option<String>,
-    
+
     /// Do not send requests; print what would be sent
     #[arg(long)]
     dry_run: bool,
-    
+
     /// Print verbose HTTP requests/responses
     #[arg(long, short = 'v')]
     verbose: bool,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Add a torrent (magnet link or .torrent file)
+    Add {
+        /// Path to a .torrent file or a magnet link
+        input: String,
+
+        /// Destination folder for the torrent content
+        #[arg(short, long)]
+        dest: Option<PathBuf>,
+    },
+    /// List torrents (default: active torrents). Use --all to show all.
+    List {
+        /// Show all torrents, not only active ones
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Deserialize, Debug)]
@@ -90,22 +105,13 @@ fn read_config(path: Option<PathBuf>) -> Config {
 }
 
 fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-    let config = read_config(args.config.clone());
-
-    // save path: CLI override > config.default_save_path > cwd
-    let save_path = if let Some(d) = args.dest.clone() {
-        d
-    } else if let Some(ref s) = config.default_save_path {
-        PathBuf::from(s)
-    } else {
-        std::env::current_dir()?
-    };
+    let cli = Cli::parse();
+    let config = read_config(cli.config.clone());
 
     let client = Client::builder().cookie_store(true).build()?;
 
     // Determine effective host and credentials (CLI overrides > config > default)
-    let host = if let Some(h) = args.host.clone() {
+    let host = if let Some(h) = cli.host.clone() {
         h.trim_end_matches('/').to_string()
     } else if let Some(ref qb) = config.qbittorrent {
         qb.host.trim_end_matches('/').to_string()
@@ -113,17 +119,97 @@ fn main() -> anyhow::Result<()> {
         "http://127.0.0.1:8080".to_string()
     };
 
-    let username = args.username.clone().or_else(|| config.qbittorrent.as_ref().and_then(|q| q.username.clone()));
-    let password = args.password.clone().or_else(|| config.qbittorrent.as_ref().and_then(|q| q.password.clone()));
+    let username = cli.username.clone().or_else(|| config.qbittorrent.as_ref().and_then(|q| q.username.clone()));
+    let password = cli.password.clone().or_else(|| config.qbittorrent.as_ref().and_then(|q| q.password.clone()));
 
-    // Determine input type and call API with derived host/credentials
-    if args.input.starts_with("magnet:") {
-        add_magnet(&client, &host, username.as_deref(), password.as_deref(), &args.input, &save_path, args.dry_run, args.verbose)?;
-    } else {
-        add_torrent_file(&client, &host, username.as_deref(), password.as_deref(), PathBuf::from(args.input), &save_path, args.dry_run, args.verbose)?;
+    match cli.command {
+        Command::Add { input, dest } => {
+            // save path: CLI override > config.default_save_path > cwd
+            let save_path = if let Some(d) = dest {
+                d
+            } else if let Some(ref s) = config.default_save_path {
+                PathBuf::from(s)
+            } else {
+                std::env::current_dir()?
+            };
+
+            if input.starts_with("magnet:") {
+                add_magnet(&client, &host, username.as_deref(), password.as_deref(), &input, &save_path, cli.dry_run, cli.verbose)?;
+            } else {
+                add_torrent_file(&client, &host, username.as_deref(), password.as_deref(), PathBuf::from(input), &save_path, cli.dry_run, cli.verbose)?;
+            }
+            println!("Added to qBittorrent (destination: {})", save_path.display());
+        }
+        Command::List { all } => {
+            list_torrents(&client, &host, username.as_deref(), password.as_deref(), all, cli.verbose)?;
+        }
     }
 
-    println!("Added to qBittorrent (destination: {})", save_path.display());
+    Ok(())
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct TorrentInfo {
+    name: String,
+    hash: String,
+    state: String,
+    progress: Option<f64>,
+    dlspeed: Option<u64>,
+    upspeed: Option<u64>,
+}
+
+fn bytes_human(b: u64) -> String {
+    let kb = 1024u64;
+    if b >= kb * kb * kb {
+        format!("{:.2} GB/s", b as f64 / (kb * kb * kb) as f64)
+    } else if b >= kb * kb {
+        format!("{:.2} MB/s", b as f64 / (kb * kb) as f64)
+    } else if b >= kb {
+        format!("{:.2} KB/s", b as f64 / kb as f64)
+    } else {
+        format!("{} B/s", b)
+    }
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        s.to_string()
+    } else {
+        let mut t = s[..n].to_string();
+        t.push_str("...");
+        t
+    }
+}
+
+fn list_torrents(client: &Client, host: &str, username: Option<&str>, password: Option<&str>, all: bool, verbose: bool) -> anyhow::Result<()> {
+    login(client, host, username, password, verbose)?;
+    let url = format!("{}/api/v2/torrents/info?filter=all", host);
+    let res = client.get(&url).send()?;
+    let body = res.text()?;
+    let torrents: Vec<TorrentInfo> = serde_json::from_str(&body)?;
+
+    // filter active by default: progress < 1.0 or dlspeed/upspeed > 0
+    let rows: Vec<&TorrentInfo> = torrents.iter().filter(|t| {
+        if all {
+            return true;
+        }
+        let progress = t.progress.unwrap_or(0.0);
+        let dls = t.dlspeed.unwrap_or(0);
+        let ups = t.upspeed.unwrap_or(0);
+        progress < 1.0 || dls > 0 || ups > 0
+    }).collect();
+
+    // header
+    println!("{:<10} {:<40} {:<12} {:>8} {:>12}", "id", "name", "status", "progress", "dl/up");
+    for t in rows {
+        let id = &t.hash[..8];
+        let name = truncate(&t.name, 40);
+        let status = &t.state;
+        let progress = t.progress.map(|p| format!("{:.1}%", p * 100.0)).unwrap_or_else(|| "-".to_string());
+        let dl = bytes_human(t.dlspeed.unwrap_or(0));
+        let up = bytes_human(t.upspeed.unwrap_or(0));
+        println!("{:<10} {:<40} {:<12} {:>8} {:>6} / {:<6}", id, name, status, progress, dl, up);
+    }
     Ok(())
 }
 

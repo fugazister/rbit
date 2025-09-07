@@ -44,13 +44,47 @@ Examples:
 ./target/release/rbit ./some.torrent --config ./rbit.toml --host http://127.0.0.1:8080
 ```
 
-Config file (toml) example — place `rbit.toml` in the repo root or in your XDG config dir (`$XDG_CONFIG_HOME/com/example/rbit/rbit.toml`):
+Commands
+--------
+
+This tool uses subcommands. Two provided commands are `add` and `list`.
+
+- Add: add a magnet link or .torrent file
+
+```sh
+# add a magnet
+./target/release/rbit add 'magnet:?xt=urn:btih:...' --dest=/downloads
+
+# add a torrent file
+./target/release/rbit add ./some.torrent --dest=/downloads
+```
+
+- List: show currently active torrents by default (downloading/seeding/idle). Use `--all` to include completed/inactive torrents.
+
+```sh
+# list active torrents
+./target/release/rbit list
+
+# list all torrents
+./target/release/rbit list --all
+```
+
+The `list` output columns:
+
+- id: short torrent identifier (hash prefix) — use this for pause/resume/remove later
+- name: file name (truncated)
+- status: torrent state (downloading, uploading, paused, etc.)
+- progress: percent downloaded
+- dl/up: current download/upload speeds
+
+
+Config file (toml) example — place `rbit.toml` in the repo root or in your XDG config dir (`$XDG_CONFIG_HOME/rbit/config.toml` or `~/.config/rbit/config.toml`):
 
 ```toml
 default_save_path = "/downloads"
 
 [qbittorrent]
-host = "http://http://127.0.0.1:8080"
+host = "http://127.0.0.1:8080"
 username = "admin"
 password = "secret"
 ```
