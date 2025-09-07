@@ -1,0 +1,176 @@
+use std::fs::File;
+use std::io::Read;
+use std::path::PathBuf;
+
+use clap::Parser;
+use directories::ProjectDirs;
+use reqwest::blocking::Client;
+use reqwest::blocking::multipart;
+use serde::Deserialize;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about = "simple qBittorrent client", long_about = None)]
+struct Args {
+    /// Path to a .torrent file or a magnet link
+    input: String,
+
+    /// Destination folder for the torrent content
+    #[arg(short, long)]
+    dest: Option<PathBuf>,
+
+    /// Path to config file (optional)
+    #[arg(short = 'c', long)]
+    config: Option<PathBuf>,
+    
+    /// qBittorrent host (overrides config)
+    #[arg(long)]
+    host: Option<String>,
+
+    /// qBittorrent username (overrides config)
+    #[arg(long)]
+    username: Option<String>,
+
+    /// qBittorrent password (overrides config)
+    #[arg(long)]
+    password: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct Config {
+    default_save_path: Option<String>,
+    qbittorrent: Option<QBConfig>,
+}
+
+#[derive(Deserialize, Debug)]
+struct QBConfig {
+    host: String,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+fn read_config(path: Option<PathBuf>) -> Config {
+    let config_path = match path {
+        Some(p) => p,
+        None => {
+            if let Some(dirs) = ProjectDirs::from("com", "example", "rbit") {
+                dirs.config_dir().join("rbit.toml")
+            } else {
+                PathBuf::from("rbit.toml")
+            }
+        }
+    };
+
+    // Prefer XDG config path but fall back to ./rbit.toml in the repo if present
+    let final_path = if config_path.exists() {
+        config_path
+    } else {
+        let local = PathBuf::from("rbit.toml");
+        if local.exists() {
+            local
+        } else {
+            config_path
+        }
+    };
+
+    if final_path.exists() {
+        let mut s = String::new();
+        File::open(&final_path)
+            .and_then(|mut f| f.read_to_string(&mut s))
+            .expect("failed to read config");
+        toml::from_str(&s).expect("failed to parse config")
+    } else {
+        Config {
+            default_save_path: None,
+            qbittorrent: None,
+        }
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    let config = read_config(args.config.clone());
+
+    let save_path = if let Some(d) = args.dest.clone() {
+        d
+    } else if let Some(ref s) = config.default_save_path {
+        PathBuf::from(s)
+    } else {
+        std::env::current_dir()?
+    };
+
+    let client = Client::builder().cookie_store(true).build()?;
+
+    // Determine effective host and credentials (CLI overrides > config > default)
+    let host = if let Some(h) = args.host.clone() {
+        h.trim_end_matches('/').to_string()
+    } else if let Some(ref qb) = config.qbittorrent {
+        qb.host.trim_end_matches('/').to_string()
+    } else {
+        "http://127.0.0.1:8080".to_string()
+    };
+
+    let username = args.username.clone().or_else(|| config.qbittorrent.as_ref().and_then(|q| q.username.clone()));
+    let password = args.password.clone().or_else(|| config.qbittorrent.as_ref().and_then(|q| q.password.clone()));
+
+    // Determine input type and call API with derived host/credentials
+    if args.input.starts_with("magnet:") {
+        add_magnet(&client, &host, username.as_deref(), password.as_deref(), &args.input, &save_path)?;
+    } else {
+        add_torrent_file(&client, &host, username.as_deref(), password.as_deref(), PathBuf::from(args.input), &save_path)?;
+    }
+
+    println!("Added to qBittorrent (destination: {})", save_path.display());
+    Ok(())
+}
+
+// qb_host removed — host is computed from config/CLI overrides in `main`
+
+fn login(client: &Client, host: &str, username: Option<&str>, password: Option<&str>) -> anyhow::Result<()> {
+    if let (Some(user), Some(pass)) = (username, password) {
+        let params = [("username", user), ("password", pass)];
+        let url = format!("{}/api/v2/auth/login", host);
+        let res = client.post(&url).form(&params).send()?;
+        let text = res.text()?;
+        if text != "Ok." {
+            anyhow::bail!("login failed: {}", text);
+        }
+    }
+    Ok(())
+}
+
+fn add_magnet(client: &Client, host: &str, username: Option<&str>, password: Option<&str>, magnet: &str, save_path: &PathBuf) -> anyhow::Result<()> {
+    login(client, host, username, password)?;
+    let url = format!("{}/api/v2/torrents/add", host);
+    let save_path_s = save_path.to_string_lossy().to_string();
+    let params = [("urls", magnet), ("savepath", save_path_s.as_str())];
+    let res = client.post(&url).form(&params).send()?;
+    if res.status().is_success() {
+        Ok(())
+    } else {
+        anyhow::bail!("failed to add magnet: {}", res.text()?);
+    }
+}
+
+fn add_torrent_file(client: &Client, host: &str, username: Option<&str>, password: Option<&str>, file: PathBuf, save_path: &PathBuf) -> anyhow::Result<()> {
+    login(client, host, username, password)?;
+    let url = format!("{}/api/v2/torrents/add", host);
+
+    let filename = file
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("upload.torrent")
+        .to_string();
+
+    let file_part = multipart::Part::reader(File::open(&file)?).file_name(filename);
+
+    let form = multipart::Form::new()
+        .part("torrents", file_part)
+        .text("savepath", save_path.to_string_lossy().to_string());
+
+    let res = client.post(&url).multipart(form).send()?;
+    if res.status().is_success() {
+        Ok(())
+    } else {
+        anyhow::bail!("failed to add torrent file: {}", res.text()?);
+    }
+}
